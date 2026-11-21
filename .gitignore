@@ -1,0 +1,5 @@
+# Excluded
+.env
+*.log
+.cloudflared/
+.ssh/
