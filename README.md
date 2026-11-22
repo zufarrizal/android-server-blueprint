@@ -165,6 +165,18 @@ Use `scripts/server-ctl.sh` to manage all services in one command:
 
 ---
 
+## 7. Optional Production Extensions
+
+Looking to go beyond the minimal setup? See **[OPTIONAL_FEATURES.md](OPTIONAL_FEATURES.md)** for modular guides on:
+- **Golang SSR & Hardware Telemetry Backend (`:8081`)**
+- **PageSpeed 100/100/100/100 Optimization & `llms.txt`**
+- **Cloudflare Edge Worker + KV Zero-Downtime Failover (`Flight Mode`)**
+- **Telegram Bot Control Plane & SoC Thermal Alerts**
+- **WebP Content Negotiation & OpenGraph Social Previews**
+- **Real-Time Market Data & Adaptive Multi-Timeframe Sync**
+
+---
+
 ## License
 
 MIT License. Free to use, modify, and distribute.
