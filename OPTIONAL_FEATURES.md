@@ -321,14 +321,143 @@ Register `/invoice/pdf` in Go to stream generated PDFs (`Content-Type: applicati
 
 ---
 
-## Module 7: Telegram Bot Control Plane & Thermal Alerts
+## Module 7: Telegram Bot Control Plane & Thermal Alerts `[Ubuntu PRoot]`
 
-### Step 7.1: Configure `.env` Inside `/opt/myserver/.env` `[Ubuntu PRoot]`
-```env
+Because the bot uses **outbound HTTPS long-polling (`getUpdates`)**, it works inside `--isolated` Ubuntu PRoot with **0 open inbound ports**.
+
+### Step 7.1: Create Bot Token & Get Your Numeric Chat ID
+1. Open **@BotFather** in Telegram → `/newbot` → copy your `TELEGRAM_BOT_TOKEN`.
+2. Open **@userinfobot** (or message your new bot and curl `https://api.telegram.org/bot<TOKEN>/getUpdates`) → copy your numeric `TELEGRAM_CHAT_ID`.
+
+### Step 7.2: Save Credentials Inside Ubuntu PRoot (`/opt/myserver/.env`)
+```bash
+proot-distro login --isolated ubuntu -- bash -c '
+cat <<EOF > /opt/myserver/.env
 TELEGRAM_BOT_TOKEN="123456:ABC-DEF..."
 TELEGRAM_CHAT_ID="your_numeric_chat_id"
+EOF
+chmod 600 /opt/myserver/.env
+'
 ```
-Run an outbound long-polling goroutine in Go (no open inbound port needed) + a 30s ticker reading `/tmp/soc_temp.txt` (bridged from Termux) to fire alerts if `temp >= 65.0°C`.
+
+### Step 7.3: Add Outbound Long-Polling Bot & Thermal Worker (`/opt/myserver/telegram.go`)
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"time"
+)
+
+func loadEnvFile(path string) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if k, v, ok := strings.Cut(line, "="); ok {
+			_ = os.Setenv(strings.TrimSpace(k), strings.Trim(strings.TrimSpace(v), `"`))
+		}
+	}
+}
+
+func sendTelegram(text string) {
+	token := os.Getenv("TELEGRAM_BOT_TOKEN")
+	chatID := os.Getenv("TELEGRAM_CHAT_ID")
+	if token == "" || chatID == "" {
+		return
+	}
+	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
+	_, _ = http.PostForm(endpoint, url.Values{"chat_id": {chatID}, "text": {text}})
+}
+
+func startTelegramBot() {
+	token := os.Getenv("TELEGRAM_BOT_TOKEN")
+	allowedChat := os.Getenv("TELEGRAM_CHAT_ID")
+	if token == "" || allowedChat == "" {
+		log.Println("[TELEGRAM] Missing token/chat_id, bot disabled.")
+		return
+	}
+
+	offset := 0
+	client := &http.Client{Timeout: 35 * time.Second}
+	log.Println("[TELEGRAM] Long-polling bot started inside Ubuntu PRoot.")
+
+	for {
+		u := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?timeout=30&offset=%d", token, offset)
+		resp, err := client.Get(u)
+		if err != nil {
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		var data struct {
+			OK     bool `json:"ok"`
+			Result []struct {
+				UpdateID int `json:"update_id"`
+				Message  *struct {
+					Chat struct {
+						ID int64 `json:"id"`
+					} `json:"chat"`
+					Text string `json:"text"`
+				} `json:"message"`
+			} `json:"result"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&data)
+		_ = resp.Body.Close()
+
+		for _, upd := range data.Result {
+			offset = upd.UpdateID + 1
+			if upd.Message == nil || fmt.Sprintf("%d", upd.Message.Chat.ID) != allowedChat {
+				continue
+			}
+			cmd := strings.TrimSpace(strings.ToLower(upd.Message.Text))
+			switch cmd {
+			case "/ping":
+				sendTelegram("🏓 Pong! Ubuntu PRoot node is online.")
+			case "/temp", "/status":
+				sendTelegram(fmt.Sprintf("📱 Node Status: ONLINE\n🌡️ SoC Temp: %.1f°C", getSoCTempC()))
+			default:
+				sendTelegram("Commands: /status, /temp, /ping")
+			}
+		}
+	}
+}
+
+func startThermalMonitor() {
+	var lastAlert time.Time
+	for range time.Tick(30 * time.Second) {
+		if temp := getSoCTempC(); temp >= 65.0 && time.Since(lastAlert) > 30*time.Minute {
+			sendTelegram(fmt.Sprintf("🔥 Thermal Alert: SoC Temp %.1f°C", temp))
+			lastAlert = time.Now()
+		}
+	}
+}
+```
+
+### Step 7.4: Enable in `main.go`, Rebuild & Verify
+In `/opt/myserver/main.go` before `http.ListenAndServe(...)`, add:
+```go
+loadEnvFile("/opt/myserver/.env")
+go startTelegramBot()
+go startThermalMonitor()
+```
+Rebuild and restart `relay` inside Ubuntu PRoot:
+```bash
+proot-distro login --isolated ubuntu -- bash -c "cd /opt/myserver && go build -o /opt/myserver/relay-service ."
+tmux kill-session -t relay 2>/dev/null || true
+tmux new-session -d -s relay "proot-distro login --isolated ubuntu -- /opt/myserver/relay-service"
+```
+Send `/status` or `/ping` to your bot on Telegram to verify it responds immediately.
 
 ---
 
