@@ -167,13 +167,17 @@ Use `scripts/server-ctl.sh` to manage all services in one command:
 
 ## 7. Optional Production Extensions
 
-Looking to go beyond the minimal setup? See **[OPTIONAL_FEATURES.md](OPTIONAL_FEATURES.md)** for modular guides on:
-- **Golang SSR & Hardware Telemetry Backend (`:8081`)**
-- **PageSpeed 100/100/100/100 Optimization & `llms.txt`**
-- **Cloudflare Edge Worker + KV Zero-Downtime Failover (`Flight Mode`)**
-- **Telegram Bot Control Plane & SoC Thermal Alerts**
-- **WebP Content Negotiation & OpenGraph Social Previews**
-- **Real-Time Market Data & Adaptive Multi-Timeframe Sync**
+Looking to go beyond the minimal setup? See **[OPTIONAL_FEATURES.md](OPTIONAL_FEATURES.md)** for full implementation details on:
+1. **Golang SSR Engine & SQLite (WAL) Persistence (`:8081`)**
+2. **Security Hardening, Rate Limiter & IP Reputation**
+3. **PageSpeed 100/100/100/100 Frontend & AI Discoverability (`/llms.txt`)**
+4. **Cloudflare Edge Worker, KV Mirror & D1 (`3-Tier Routing`)**
+5. **Full-Stack Storefront, Admin CMS, PDF Invoices & WebP Pipeline**
+6. **Telegram Control Plane, Multi-Provider AI Core & Voice/Call Alerts**
+7. **Self-Hosted Media Downloader (`yt-dlp` + OAuth)**
+8. **Built-In Load Tester (`/benchmark`) & Visitor Radar**
+9. **Live Market Data & Adaptive Order Block Radar (`/trading`)**
+10. **Overwatch Dual-Tier Watchdog & CLI Tooling**
 
 ---
 
