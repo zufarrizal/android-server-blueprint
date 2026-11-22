@@ -1,20 +1,41 @@
-# Optional Production Features — Step-by-Step Build Tutorial
+# Optional Production Features — Ubuntu PRoot (Termux) Setup Guide
 
-This hands-on tutorial shows you how to build and layer each optional production module onto the base **Android Server Blueprint** (`Termux + Ubuntu 24.04 PRoot + Nginx :8080 + Cloudflare Named Tunnel`). Every section includes exact commands, copy-pasteable code/configs, and verification steps.
+This guide explains how to install and wire each optional production feature when running your server inside **Ubuntu 24.04 LTS (PRoot)** on **Termux**.
 
 ---
 
-## Module 1: Golang SSR Engine, Hardware Telemetry & SQLite (WAL)
+## How Termux Host & Ubuntu PRoot Work Together
 
-### Step 1.1: Install Go inside Termux
+Because PRoot runs Ubuntu as an unprivileged userland container without `systemd`, keep this boundary in mind:
+
+| Layer | What Runs Here | Why |
+| :--- | :--- | :--- |
+| **Termux Host** | `termux-wake-lock`, `cloudflared`, `tmux`, `watchdog.sh`, Android `/sys/class/thermal` | Direct access to Android wake-lock, hardware thermal sensors, and network tunnel daemon. |
+| **Ubuntu 24.04 PRoot** (`--isolated`) | Nginx (`:8080`), Go SSR Relay (`:8081`), SQLite, Node.js/Tailwind build, `cwebp`, `yt-dlp`, `ffmpeg` | Standard Linux `apt` packages, `/var/www/html/`, `/etc/nginx/`, and glibc binaries work cleanly. |
+
+> **Important PRoot Rules:**
+> 1. **`systemctl` does not work in PRoot.** Always start background processes using `proot-distro login --isolated -d ubuntu -- <command>` or inside a Termux `tmux` session.
+> 2. **Loopback (`127.0.0.1`) is shared.** `cloudflared` on Termux reaches Nginx on `127.0.0.1:8080`, and Nginx inside Ubuntu reaches your Go backend on `127.0.0.1:8081`.
+> 3. **Use standard Ubuntu `apt` inside PRoot**, not Termux `pkg`, for server dependencies.
+
+---
+
+## Module 1: Golang SSR Engine, SQLite (WAL) & Telemetry (`:8081`)
+
+### Step 1.1: Install Go, GCC & SQLite `[Ubuntu PRoot]`
+Enter Ubuntu PRoot:
 ```bash
-pkg install -y golang sqlite
-mkdir -p ~/relay/data && cd ~/relay
+proot-distro login --isolated ubuntu
+```
+Inside Ubuntu, install Go, C compiler (needed by `go-sqlite3` CGO), and SQLite:
+```bash
+apt update && apt install -y golang-go build-essential sqlite3 libsqlite3-dev
+mkdir -p /opt/myserver/data && cd /opt/myserver
 go mod init myserver-relay
 go get github.com/mattn/go-sqlite3
 ```
 
-### Step 1.2: Create the Go Server (`~/relay/main.go`)
+### Step 1.2: Create `/opt/myserver/main.go` `[Ubuntu PRoot]`
 ```go
 package main
 
@@ -25,7 +46,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -34,22 +54,17 @@ import (
 )
 
 func getSoCTempC() float64 {
-	zones, _ := filepath.Glob("/sys/class/thermal/thermal_zone*/temp")
-	for _, z := range zones {
-		if b, err := os.ReadFile(z); err == nil {
-			if v, err := strconv.ParseFloat(strings.TrimSpace(string(b)), 64); err == nil && v > 0 {
-				if v > 1000 {
-					v /= 1000.0
-				}
-				return v
-			}
+	// Termux host can write /tmp/soc_temp.txt into Ubuntu rootfs, or read /sys if exposed
+	if b, err := os.ReadFile("/tmp/soc_temp.txt"); err == nil {
+		if v, err := strconv.ParseFloat(strings.TrimSpace(string(b)), 64); err == nil {
+			return v
 		}
 	}
 	return 0
 }
 
 func initDB() *sql.DB {
-	db, err := sql.Open("sqlite3", "./data/store.db?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000")
+	db, err := sql.Open("sqlite3", "/opt/myserver/data/store.db?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -75,20 +90,32 @@ func main() {
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprintf(w, "<!DOCTYPE html><html lang='en'><body><h1>Android Node Online</h1><p>SoC Temp: %.1f C</p></body></html>", getSoCTempC())
+		fmt.Fprintf(w, "<!DOCTYPE html><html lang='en'><body><h1>Ubuntu PRoot Go Node Online</h1><p>SoC Temp: %.1f C</p></body></html>", getSoCTempC())
 	})
 
 	log.Println("Go SSR listening on 127.0.0.1:8081")
 	log.Fatal(http.ListenAndServe("127.0.0.1:8081", mux))
 }
 ```
-
-### Step 1.3: Build, Run in `tmux`, and Proxy via Nginx
+Compile inside Ubuntu PRoot:
 ```bash
-cd ~/relay && go build -o relay-service .
-tmux new-session -d -s relay "~/relay/relay-service"
+cd /opt/myserver && go build -o /opt/myserver/relay-service .
+exit
 ```
-Update Nginx (`/etc/nginx/sites-available/default`) inside Ubuntu PRoot:
+
+### Step 1.3: Bridge SoC Thermal from Termux Host (Optional) `[Termux Host]`
+Because `--isolated` PRoot hides Android `/sys`, a 1-line cron/loop on Termux writes the thermal readout into Ubuntu's `/tmp/soc_temp.txt`:
+```bash
+UBUNTU_TMP="/data/data/com.termux/files/usr/var/lib/proot-distro/containers/ubuntu/rootfs/tmp/soc_temp.txt"
+cat /sys/class/thermal/thermal_zone0/temp | awk '{printf "%.1f\n", $1/1000}' > "$UBUNTU_TMP"
+```
+
+### Step 1.4: Run Go Relay in `tmux` & Configure Nginx `[Termux Host + Ubuntu PRoot]`
+Start the Ubuntu Go binary from Termux inside `tmux`:
+```bash
+tmux new-session -d -s relay "proot-distro login --isolated ubuntu -- /opt/myserver/relay-service"
+```
+Configure `/etc/nginx/sites-available/default` inside Ubuntu PRoot:
 ```nginx
 upstream relay_backend {
     server 127.0.0.1:8081;
@@ -110,7 +137,7 @@ server {
     }
 }
 ```
-Reload and verify:
+Reload and test:
 ```bash
 proot-distro login --isolated ubuntu -- nginx -t && proot-distro login --isolated ubuntu -- nginx -s reload
 curl -s http://127.0.0.1:8080/api/telemetry
@@ -118,14 +145,16 @@ curl -s http://127.0.0.1:8080/api/telemetry
 
 ---
 
-## Module 2: Rate Limiter Middleware, IP Reputation & OWASP Headers
+## Module 2: Rate Limiter Middleware & OWASP Security Headers
 
-### Step 2.1: Add Per-IP Token-Bucket Middleware (`~/relay/guard.go`)
+### Step 2.1: Add Per-IP Rate Limiter (`guard.go`) `[Ubuntu PRoot]`
+Create `/opt/myserver/guard.go` inside Ubuntu and wrap `mux` with `rateLimitMiddleware(mux, 90)`:
 ```go
 package main
 
 import (
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -173,8 +202,8 @@ func rateLimitMiddleware(next http.Handler, limitPerMin float64) http.Handler {
 }
 ```
 
-### Step 2.2: Add OWASP & Origin Isolation Headers in Nginx
-Add inside the `server { ... }` block of `/etc/nginx/sites-available/default`:
+### Step 2.2: Add OWASP & COOP Headers in Nginx `[Ubuntu PRoot]`
+Inside `/etc/nginx/sites-available/default` (`server { ... }`):
 ```nginx
 server_tokens off;
 location ~ /\. { deny all; access_log off; log_not_found off; }
@@ -186,54 +215,33 @@ add_header X-Content-Type-Options "nosniff" always;
 add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
 ```
-Verify headers:
-```bash
-curl -sI https://yourdomain.com/ | grep -iE "strict-transport|cross-origin|x-ratelimit"
-```
 
 ---
 
 ## Module 3: PageSpeed 100/100/100/100 Frontend & `/llms.txt`
 
-### Step 3.1: Compile & Purge Tailwind + DaisyUI at Build Time
-Avoid runtime `tailwind.js` and unpurged `daisyui.min.css`. Install the build CLI once in Termux:
+### Step 3.1: Install Node.js & Build Purged CSS `[Ubuntu PRoot]`
+Inside Ubuntu PRoot (`npx` and `/usr/bin/env` work natively without Termux shebang issues):
 ```bash
-pkg install -y nodejs
-mkdir -p ~/relay/css-build && cd ~/relay/css-build
-npm init -y && npm install -D tailwindcss@3 daisyui@4
+proot-distro login --isolated ubuntu -- bash -c "
+  apt update && apt install -y nodejs npm
+  mkdir -p /opt/myserver/css-build /var/www/html/assets
+  cd /opt/myserver/css-build
+  npm init -y && npm install -D tailwindcss@3 daisyui@4
+"
 ```
-Create `~/relay/css-build/tailwind.config.js`:
-```js
-module.exports = {
-  content: ["../views/**/*.html", "../*.go"],
-  plugins: [require("daisyui")],
-  daisyui: { themes: ["night"], logs: false }
-};
-```
-Create `~/relay/css-build/input.css`:
-```css
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-```
-Build the purged stylesheet (~20 KB gzipped):
+Create `/opt/myserver/css-build/tailwind.config.js` and `input.css`, then compile:
 ```bash
-node ./node_modules/tailwindcss/lib/cli.js -i ./input.css -o /data/data/com.termux/files/usr/var/lib/proot-distro/containers/ubuntu/rootfs/var/www/html/assets/app.min.css --minify
+proot-distro login --isolated ubuntu -- bash -c "
+  cd /opt/myserver/css-build
+  npx tailwindcss -i ./input.css -o /var/www/html/assets/app.min.css --minify
+"
 ```
+Inline `/var/www/html/assets/app.min.css` in your Go layout `<style>{{.InlineCSS}}</style>` (cached via `sync.Once`) and load Google Fonts (`display=optional`) + icons asynchronously (`media="print" onload="this.media='all'"`).
 
-### Step 3.2: Inline Purged CSS & Async Fonts in Your Layout `<head>`
-Load `app.min.css` once in Go (`sync.Once` + `os.ReadFile`) and render `<style>{{.InlineCSS}}</style>` so there are **0 render-blocking CSS requests**. Load Google Fonts (`display=optional` for 0 CLS) and icons asynchronously:
-```html
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700&display=optional" rel="stylesheet" media="print" onload="this.media='all'">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" media="print" onload="this.media='all'">
-<script src="/assets/htmx.min.js" defer></script>
-```
-
-### Step 3.3: Add `/llms.txt` for AI Agent Discoverability
-Create `/var/www/html/llms.txt` inside Ubuntu PRoot:
-```markdown
+### Step 3.2: Add `/llms.txt` `[Ubuntu PRoot]`
+```bash
+cat <<'EOF' > /var/www/html/llms.txt
 # My Android Server Node
 
 > 24/7 self-hosted server running on ARM64 Android + Ubuntu 24.04 PRoot + Golang SSR.
@@ -241,113 +249,49 @@ Create `/var/www/html/llms.txt` inside Ubuntu PRoot:
 ## Core Pages
 - [Home](https://yourdomain.com/): Live telemetry and overview.
 - [Products](https://yourdomain.com/products): Services and packages.
+EOF
 ```
-Expose it in Nginx:
+Add to `/etc/nginx/sites-available/default`:
 ```nginx
 location = /llms.txt {
     default_type text/markdown;
     try_files /llms.txt =404;
 }
 ```
-Verify:
-```bash
-curl -sI https://yourdomain.com/llms.txt
-```
 
 ---
 
 ## Module 4: Cloudflare Edge Worker + KV Zero-Downtime Failover
 
-### Step 4.1: Create KV Namespace & Configure Wrangler
+### Step 4.1: Deploy Wrangler from Ubuntu PRoot `[Ubuntu PRoot]`
 ```bash
-npm install -g wrangler
-wrangler login
-wrangler kv namespace create ADMIN_KV
+proot-distro login --isolated ubuntu -- bash -c "
+  npm install -g wrangler
+  wrangler login
+  wrangler kv namespace create ADMIN_KV
+"
 ```
-Create `~/edge-worker/wrangler.toml`:
-```toml
-name = "android-edge-failover"
-main = "index.js"
-compatibility_date = "2024-01-01"
-
-routes = [
-  { pattern = "yourdomain.com/*", zone_name = "yourdomain.com" }
-]
-
-[[kv_namespaces]]
-binding = "ADMIN_KV"
-id = "<YOUR_KV_NAMESPACE_ID>"
-```
-
-### Step 4.2: Create `~/edge-worker/index.js`
-```javascript
-const ORIGIN_URL = "https://yourdomain.com";
-const BYPASS_PREFIXES = ["/admin", "/api/send-message", "/api/webhook"];
-
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    if (request.headers.get("X-Edge-Bypass") === "1") {
-      return fetch(request);
-    }
-
-    const bypass = BYPASS_PREFIXES.some(p => url.pathname.startsWith(p));
-    const snapKey = `snapshot:${url.pathname}`;
-
-    try {
-      const headers = new Headers(request.headers);
-      headers.set("X-Edge-Bypass", "1");
-      const res = await fetch(new Request(ORIGIN_URL + url.pathname + url.search, {
-        method: request.method, headers,
-        body: (request.method !== "GET" && request.method !== "HEAD") ? request.body : undefined
-      }));
-
-      if (res.ok) {
-        const ct = res.headers.get("Content-Type") || "";
-        if (!bypass && request.method === "GET" && ct.includes("text/html") && env.ADMIN_KV) {
-          ctx.waitUntil(res.clone().text().then(body => env.ADMIN_KV.put(snapKey, body)));
-        }
-        const out = new Headers(res.headers);
-        out.set("X-Node-Mode", "DIRECT");
-        return new Response(res.body, { status: res.status, headers: out });
-      }
-    } catch (_) {}
-
-    // Origin unreachable -> Flight Mode KV Failover
-    if (env.ADMIN_KV) {
-      const snap = await env.ADMIN_KV.get(snapKey);
-      if (snap) {
-        return new Response(snap, {
-          status: 200,
-          headers: { "Content-Type": "text/html; charset=utf-8", "X-Node-Mode": "FLIGHT" }
-        });
-      }
-    }
-    return new Response("Origin temporarily offline", { status: 503 });
-  }
-};
-```
-Deploy:
+Create `/opt/edge-worker/wrangler.toml` and `index.js` (caching `200 OK` HTML into `ADMIN_KV` and serving `FLIGHT MODE` snapshots if your PRoot server is offline/rebooting), then run:
 ```bash
-cd ~/edge-worker && wrangler deploy
+proot-distro login --isolated ubuntu -- bash -c "cd /opt/edge-worker && wrangler deploy"
 ```
 
 ---
 
-## Module 5: WebP Auto-Negotiation, `cwebp` Pipeline & OpenGraph Banner
+## Module 5: WebP Auto-Negotiation, `cwebp` & OpenGraph Banner
 
-### Step 5.1: Install `cwebp` & Configure Nginx WebP Negotiation
+### Step 5.1: Install `webp` Inside Ubuntu PRoot `[Ubuntu PRoot]`
 ```bash
-pkg install -y libwebp
+proot-distro login --isolated ubuntu -- apt install -y webp
 ```
-Inside Ubuntu PRoot, create `/etc/nginx/conf.d/webp.conf`:
+Create `/etc/nginx/conf.d/webp.conf`:
 ```nginx
 map $http_accept $webp_suffix {
     default "";
     "~*webp" ".webp";
 }
 ```
-Add these blocks to `/etc/nginx/sites-available/default`:
+Add to `/etc/nginx/sites-available/default`:
 ```nginx
 location = /assets/og-banner.png {
     add_header Cache-Control "public, max-age=3600";
@@ -360,173 +304,91 @@ location ~* ^/assets/.+\.(?:jpe?g|png)$ {
     try_files $uri$webp_suffix $uri =404;
 }
 ```
-
-### Step 5.2: Convert Uploaded Images Automatically
+Convert images via Go (`exec.Command("cwebp", ...)`) or CLI inside Ubuntu:
 ```bash
 cwebp -q 82 -resize 1200 0 -m 4 -metadata none input.png -o /var/www/html/assets/products/item-cover.webp
 ```
 
-### Step 5.3: Add Full OpenGraph & Twitter Card Tags (`<head>`)
-```html
-<meta property="og:title" content="My Android Server Node">
-<meta property="og:description" content="24/7 ARM64 self-hosted server.">
-<meta property="og:url" content="https://yourdomain.com/">
-<meta property="og:type" content="website">
-<meta property="og:image" content="https://yourdomain.com/assets/og-banner.png">
-<meta property="og:image:secure_url" content="https://yourdomain.com/assets/og-banner.png">
-<meta property="og:image:type" content="image/png">
-<meta property="og:image:width" content="1200">
-<meta property="og:image:height" content="630">
-<meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="My Android Server Node">
-<meta name="twitter:description" content="24/7 ARM64 self-hosted server.">
-<meta name="twitter:image" content="https://yourdomain.com/assets/og-banner.png">
+---
+
+## Module 6: PDF Invoice Generator (`gofpdf`) `[Ubuntu PRoot]`
+
+Inside `/opt/myserver` in Ubuntu PRoot:
+```bash
+go get github.com/jung-kurt/gofpdf
 ```
+Register `/invoice/pdf` in Go to stream generated PDFs (`Content-Type: application/pdf`) directly from SQLite invoice records.
 
 ---
 
-## Module 6: PDF Invoice Generator & Webhook Integration
+## Module 7: Telegram Bot Control Plane & Thermal Alerts
 
-### Step 6.1: Install `gofpdf`
-```bash
-cd ~/relay && go get github.com/jung-kurt/gofpdf
-```
-
-### Step 6.2: Render Invoice PDFs Directly in Go (`~/relay/pdf_invoice.go`)
-```go
-package main
-
-import (
-	"net/http"
-	"github.com/jung-kurt/gofpdf"
-)
-
-func handleInvoicePDF(w http.ResponseWriter, r *http.Request) {
-	pdf := gofpdf.New("P", "mm", "A4", "")
-	pdf.AddPage()
-	pdf.SetFont("Arial", "B", 16)
-	pdf.Cell(40, 10, "INVOICE #INV-001")
-	pdf.Ln(12)
-	pdf.SetFont("Arial", "", 12)
-	pdf.Cell(40, 8, "Service: Full-Stack Server Deployment")
-
-	w.Header().Set("Content-Type", "application/pdf")
-	w.Header().Set("Content-Disposition", `inline; filename="invoice.pdf"`)
-	_ = pdf.Output(w)
-}
-```
-
----
-
-## Module 7: Telegram Control Plane, Thermal Alerts & AI Core
-
-### Step 7.1: Create `.env` (Excluded from Git)
-```bash
-cat <<'EOF' > ~/relay/.env
+### Step 7.1: Configure `.env` Inside `/opt/myserver/.env` `[Ubuntu PRoot]`
+```env
 TELEGRAM_BOT_TOKEN="123456:ABC-DEF..."
 TELEGRAM_CHAT_ID="your_numeric_chat_id"
-EOF
+```
+Run an outbound long-polling goroutine in Go (no open inbound port needed) + a 30s ticker reading `/tmp/soc_temp.txt` (bridged from Termux) to fire alerts if `temp >= 65.0°C`.
+
+---
+
+## Module 8: Self-Hosted Media Downloader (`yt-dlp` + `ffmpeg`) `[Ubuntu PRoot]`
+
+### Step 8.1: Install inside Ubuntu PRoot
+```bash
+proot-distro login --isolated ubuntu -- bash -c "
+  apt update && apt install -y python3 python3-pip ffmpeg
+  pip3 install --break-system-packages -U yt-dlp
+"
+```
+Test extraction inside Ubuntu PRoot:
+```bash
+proot-distro login --isolated ubuntu -- yt-dlp --dump-json --skip-download "https://www.youtube.com/watch?v=dQw4w9WgXcQ" | head -c 300
 ```
 
-### Step 7.2: Outbound Long-Polling & Thermal Alert Worker (`~/relay/telegram.go`)
-```go
-package main
+---
 
-import (
-	"fmt"
-	"net/http"
-	"net/url"
-	"os"
-	"time"
-)
+## Module 9: Load Tester (`/benchmark`) & Live Market Radar (`/trading`)
 
-func sendTelegram(text string) {
-	token := os.Getenv("TELEGRAM_BOT_TOKEN")
-	chatID := os.Getenv("TELEGRAM_CHAT_ID")
-	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
-	_, _ = http.PostForm(endpoint, url.Values{
-		"chat_id": {chatID},
-		"text":    {text},
-	})
-}
-
-func startThermalMonitor() {
-	for range time.Tick(30 * time.Second) {
-		if temp := getSoCTempC(); temp >= 65.0 {
-			sendTelegram(fmt.Sprintf("🔥 Thermal Alert: SoC Temp %.1f°C", temp))
-		}
-	}
-}
+### Step 9.1: Install Python WebSocket Client inside Ubuntu PRoot `[Ubuntu PRoot]`
+```bash
+proot-distro login --isolated ubuntu -- pip3 install --break-system-packages websocket-client
 ```
+Run your TradingView WebSocket sync script (`tv_sunflow_sync.py`) inside PRoot via `tmux` or a Go ticker, writing `trading_cache.json` to `/opt/myserver/data/trading_cache.json` with adaptive bar expansion (`800 -> 2000 -> 5000` bars) so every timeframe maintains at least 3 valid Order Blocks.
 
-### Step 7.3: CLI SITREP Helper (`~/bin/telegram-sitrep`)
+---
+
+## Module 10: Dual-Tier Watchdog for PRoot Daemons `[Termux Host]`
+
+Because PRoot has no `systemd`, supervise **both** Ubuntu PRoot daemons (Nginx + Go Relay) and the Termux `cloudflared` tunnel from Termux `~/scripts/watchdog.sh`:
+
 ```bash
 #!/data/data/com.termux/files/usr/bin/bash
-source ~/relay/.env
-curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-  -d "chat_id=${TELEGRAM_CHAT_ID}" \
-  --data-urlencode "text=$1" >/dev/null
-```
-```bash
-chmod +x ~/bin/telegram-sitrep
-~/bin/telegram-sitrep "Server deployment verified!"
-```
+UBUNTU_TMP="/data/data/com.termux/files/usr/var/lib/proot-distro/containers/ubuntu/rootfs/tmp/soc_temp.txt"
 
----
-
-## Module 8: Self-Hosted Media Downloader (`yt-dlp` + `ffmpeg`)
-
-### Step 8.1: Install Dependencies
-```bash
-pkg install -y python ffmpeg
-pip install -U yt-dlp
-```
-
-### Step 8.2: Extract Metadata & Stream Downloads from Go
-Invoke `yt-dlp` cleanly from a Go handler using `exec.CommandContext`:
-```go
-// Metadata endpoint (/api/yt/info?url=...)
-cmd := exec.CommandContext(ctx, "yt-dlp", "--dump-json", "--no-playlist", targetURL)
-out, err := cmd.Output()
-```
-Verify CLI extraction:
-```bash
-yt-dlp --dump-json --skip-download "https://www.youtube.com/watch?v=dQw4w9WgXcQ" | head -c 300
-```
-
----
-
-## Module 9: Built-In Load Tester (`/benchmark`) & Live Market Radar (`/trading`)
-
-### Step 9.1: Concurrent HTTP Benchmark Handler in Go
-Use a bounded goroutine pool (`sync.WaitGroup` + `chan struct{}`) to benchmark `http://127.0.0.1:8080/` and measure RPS, P95 latency, and SoC temperature before/after load.
-
-### Step 9.2: Adaptive Multi-Timeframe TradingView WebSocket Sync
-Install Python WebSocket client:
-```bash
-pip install websocket-client
-```
-Connect anonymously to `wss://data.tradingview.com/socket.io/websocket` and use adaptive bar lookback (`800 -> 2000 -> 5000` bars) so higher timeframes (like `30M`) always surface at least 3 valid unbroken Order Blocks into `~/relay/data/trading_cache.json`.
-
----
-
-## Module 10: Dual-Tier Watchdog & Headless Screenshots (`obscura`)
-
-### Step 10.1: Dual-Tier Watchdog Loop (`~/scripts/watchdog.sh`)
-```bash
-#!/data/data/com.termux/files/usr/bin/bash
 while true; do
-  # Fast-Heal (every 5s): check Nginx :8080 and Go Relay :8081
-  curl -sf http://127.0.0.1:8080/ >/dev/null || proot-distro login --isolated -d ubuntu -- nginx -g "daemon off;"
-  curl -sf http://127.0.0.1:8081/health >/dev/null || tmux new-session -d -s relay "~/relay/relay-service"
-  tmux has-session -t tunnel 2>/dev/null || tmux new-session -d -s tunnel "cloudflared tunnel run my-phone-server"
+  # 1. Bridge hardware SoC temp to Ubuntu PRoot
+  if [ -r /sys/class/thermal/thermal_zone0/temp ]; then
+    awk '{printf "%.1f\n", $1/1000}' /sys/class/thermal/thermal_zone0/temp > "$UBUNTU_TMP"
+  fi
+
+  # 2. Fast-Heal Nginx (:8080) inside Ubuntu PRoot
+  curl -sf http://127.0.0.1:8080/ >/dev/null || \
+    proot-distro login --isolated -d ubuntu -- nginx -g "daemon off;"
+
+  # 3. Fast-Heal Go Relay (:8081) inside Ubuntu PRoot
+  curl -sf http://127.0.0.1:8081/health >/dev/null || \
+    tmux new-session -d -s relay "proot-distro login --isolated ubuntu -- /opt/myserver/relay-service"
+
+  # 4. Fast-Heal Cloudflare Tunnel on Termux Host
+  tmux has-session -t tunnel 2>/dev/null || \
+    tmux new-session -d -s tunnel "cloudflared tunnel run my-phone-server"
+
   sleep 5
 done
 ```
-
-### Step 10.2: Lightweight Mobile Screenshots without Chromium
-Run `obscura` inside Ubuntu PRoot for fast ARM64 visual verification:
+Start it on Termux:
 ```bash
-proot-distro login --isolated ubuntu -- env OBSCURA_SHOT_W=390 OBSCURA_SHOT_H=844 \
-  obscura fetch --allow-private-network "http://127.0.0.1:8080/" --screenshot /tmp/mobile.png
+chmod +x ~/scripts/watchdog.sh
+tmux new-session -d -s watchdog "~/scripts/watchdog.sh"
 ```
